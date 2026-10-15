@@ -12,6 +12,7 @@ Reuses the SAME .env as ado_users_to_flexera.py:
 Extra .env keys for this script (all optional):
   CF_FIELD_NAME=abcde
   CF_FIELD_VALUE=yes
+  CF_FIELDS=abcde=yes;Zendesk Role=yes   # several fields at once (overrides the two above)
   CF_EMAILS_CSV=test_emails.csv
   CF_DRY_RUN=yes        # yes = show what would change, write nothing. Set to no to write.
 
@@ -117,6 +118,26 @@ def api_base():
 
 FIELD_NAME = (os.getenv("CF_FIELD_NAME") or "abcde").strip()
 FIELD_VALUE = (os.getenv("CF_FIELD_VALUE") or "yes").strip()
+
+
+def _parse_targets():
+    """CF_FIELDS=abcde=yes;Zendesk Role=yes  -> {'abcde': 'yes', 'Zendesk Role': 'yes'}
+    Falls back to CF_FIELD_NAME / CF_FIELD_VALUE when CF_FIELDS is not set."""
+    raw = (os.getenv("CF_FIELDS") or "").strip().strip('"').strip("'")
+    if not raw:
+        return {FIELD_NAME: FIELD_VALUE}
+    targets = {}
+    for part in raw.split(";"):
+        if not part.strip():
+            continue
+        if "=" not in part:
+            sys.exit(f"[config] CF_FIELDS entry '{part}' needs the form name=value")
+        name, value = part.split("=", 1)
+        targets[name.strip()] = value.strip()
+    return targets
+
+
+TARGETS = _parse_targets()   # field name -> value to set (names fixed to exact case later)
 EMAILS_CSV = os.getenv("CF_EMAILS_CSV") or "test_emails.csv"
 DRY_RUN = (os.getenv("CF_DRY_RUN") or "yes").strip().lower() != "no"
 # Single-user test: patch only this SaaS user ID (skips the email lookup)
@@ -192,22 +213,24 @@ def find_field(session, base):
         c = str(f.get("saasCategory"))
         cats[c] = cats.get(c, 0) + 1
     print(f"[flexera] {len(fields):,} custom field(s) visible, by category: {cats}")
-    for f in fields:
-        if FIELD_NAME.lower() in (f.get("fieldName") or "").lower():
-            print(f"          - {f.get('fieldName')} | category={f.get('saasCategory')} | type={f.get('dataType')}")
-    match = [f for f in fields
-             if (f.get("fieldName") or "").strip().lower() == FIELD_NAME.lower()
-             and "user" in str(f.get("saasCategory") or "").lower()]
-    if not match:
-        user_fields = sorted({str(f.get("fieldName")) for f in fields
-                              if "user" in str(f.get("saasCategory") or "").lower()})
-        print(f"[flexera] SaaS User custom fields that exist: {', '.join(user_fields) or '(none)'}")
-        sys.exit(f"[flexera] User custom field '{FIELD_NAME}' not found. "
-                 f"Create it in SaaS settings > Custom fields (category: User) - not SAM settings - "
-                 f"or set CF_FIELD_NAME to one of the names above.")
-    name = match[0]["fieldName"]   # exact name/case as stored
-    print(f"[flexera] Using field '{name}'")
-    return name
+    user_defs = {(f.get("fieldName") or "").strip().lower(): f for f in fields
+                 if "user" in str(f.get("saasCategory") or "").lower()}
+    resolved, missing = {}, []
+    for name, value in TARGETS.items():
+        f = user_defs.get(name.lower())
+        if not f:
+            missing.append(name)
+            continue
+        print(f"          - {f.get('fieldName')} | category={f.get('saasCategory')} | type={f.get('dataType')}")
+        resolved[f["fieldName"]] = value   # exact name/case as stored
+    if missing:
+        names = sorted(str(f.get("fieldName")) for f in user_defs.values())
+        print(f"[flexera] SaaS User custom fields that exist: {', '.join(names) or '(none)'}")
+        sys.exit(f"[flexera] User custom field(s) not found: {', '.join(missing)}. "
+                 f"Create them in SaaS settings > Custom fields (category: User) - not SAM settings - "
+                 f"or fix the names in CF_FIELDS.")
+    print(f"[flexera] Will set: " + ", ".join(f"{n}={v}" for n, v in resolved.items()))
+    return resolved
 
 
 _existing_cache = {}   # user ID -> list of current custom fields (when the users list includes them)
@@ -247,20 +270,24 @@ def read_existing(session, base, user_id):
     return cf if isinstance(cf, list) else None
 
 
-def merge_fields(existing, field_name, value):
-    """Keep every existing field as it is; set/replace field_name. Same shape the UI sends."""
-    merged, replaced = [], False
+def merge_fields(existing, targets):
+    """Keep every existing field; set/replace each field in targets. Same shape the UI sends."""
+    lower_targets = {n.lower(): (n, v) for n, v in targets.items()}
+    merged, done = [], set()
     for f in existing:
         name = f.get("name") if isinstance(f, dict) else None
         if not name:
             continue
-        if name.strip().lower() == field_name.lower():
-            merged.append({"name": field_name, "value": value})
-            replaced = True
+        key = name.strip().lower()
+        if key in lower_targets:
+            n, v = lower_targets[key]
+            merged.append({"name": n, "value": v})
+            done.add(key)
         else:
             merged.append({"name": name, "value": f.get("value")})
-    if not replaced:
-        merged.append({"name": field_name, "value": value})
+    for key, (n, v) in lower_targets.items():
+        if key not in done:
+            merged.append({"name": n, "value": v})
     return merged
 
 
@@ -308,12 +335,14 @@ def main():
     base = api_base()
     print(f"[config] API host: {base}")
     print(f"[config] Routes: fields={CUSTOM_FIELDS_PATH} | values={CF_VALUES_PATH} | users={USERS_PATH}")
-    print(f"[config] Field '{FIELD_NAME}' = '{FIELD_VALUE}' | "
+    print(f"[config] Fields: " + ", ".join(f"'{n}'='{v}'" for n, v in TARGETS.items()) + " | "
           f"{'DRY RUN (nothing written)' if DRY_RUN else 'LIVE - values will be written'}")
 
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {get_token()}", "Accept": "application/json"})
-    field_name = find_field(session, base)
+    targets = find_field(session, base)          # exact field name -> value
+    tkeys = {n.lower() for n in targets}
+    field_name = ", ".join(targets)              # for messages
 
     if TEST_USER_ID:
         # Single-user test: no email lookup, patch just this ID
@@ -338,23 +367,25 @@ def main():
                 results.append([email, uid, "SKIPPED",
                                 "could not read existing custom fields - not written (protects other values)"])
                 continue
-            current = next((f.get("value") for f in existing if isinstance(f, dict)
-                            and (f.get("name") or "").strip().lower() == field_name.lower()), None)
+            current = {(f.get("name") or "").strip().lower(): f.get("value")
+                       for f in existing if isinstance(f, dict)}
+            was = "; ".join(f"{n} was {current.get(n.lower())!r}" for n in targets)
+            change = ", ".join(f"{n}={v}" for n, v in targets.items())
             others = [f.get("name") for f in existing if isinstance(f, dict)
-                      and (f.get("name") or "").strip().lower() != field_name.lower()]
+                      and (f.get("name") or "").strip().lower() not in tkeys]
             keep_note = f"keeps {len(others)} other field(s): {', '.join(others) or '-'}"
-            if current is not None and str(current) == FIELD_VALUE:
-                results.append([email, uid, "UNCHANGED", f"{field_name} already '{FIELD_VALUE}'"])
+            if all(n.lower() in current and str(current[n.lower()]) == v
+                   for n, v in targets.items()):
+                results.append([email, uid, "UNCHANGED", f"already {change}"])
                 continue
-            merged = merge_fields(existing, field_name, FIELD_VALUE)
+            merged = merge_fields(existing, targets)
             if DRY_RUN:
-                results.append([email, uid, "DRY_RUN",
-                                f"would set {field_name}={FIELD_VALUE} (was {current!r}); {keep_note}"])
+                results.append([email, uid, "DRY_RUN", f"would set {change} ({was}); {keep_note}"])
                 print(f"          {email}: would send {json.dumps(merged)}")
                 continue
             resp, sent = set_value(session, base, uid, merged)
             if resp.ok:
-                results.append([email, uid, "OK", f"{field_name}={FIELD_VALUE} (was {current!r}); {keep_note}"])
+                results.append([email, uid, "OK", f"{change} ({was}); {keep_note}"])
             else:
                 results.append([email, uid, f"FAILED {resp.status_code}", resp.text[:300]])
                 if not first_error_shown:
