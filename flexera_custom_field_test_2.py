@@ -48,9 +48,16 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-CUSTOM_FIELDS_PATH = "/api/saas/consolidated-view/v2/custom-fields"
-CF_VALUES_PATH = "/api/saas/consolidated-view/v2/custom-fields/values"
-USERS_PATH = "/api/saas/consolidated-view/v1/users"
+# Routes can be overridden in .env if your host uses a different version (see flexera_route_probe.py)
+CUSTOM_FIELDS_PATH = os.getenv("CF_FIELDS_PATH") or "/api/saas/consolidated-view/v2/custom-fields"
+CF_VALUES_PATH = os.getenv("CF_VALUES_PATH") or CUSTOM_FIELDS_PATH.rstrip("/") + "/values"
+USERS_PATH = os.getenv("CF_USERS_PATH") or "/api/saas/consolidated-view/v1/users"
+
+# Accept the older .env names too (API_BASE_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET)
+for new, old in (("FLEXERA_TOKEN_URL", "TOKEN_URL"), ("FLEXERA_CLIENT_ID", "CLIENT_ID"),
+                 ("FLEXERA_CLIENT_SECRET", "CLIENT_SECRET"), ("FLEXERA_API_BASE", "API_BASE_URL")):
+    if not (os.getenv(new) or "").strip() and (os.getenv(old) or "").strip():
+        os.environ[new] = os.environ[old]
 USERS_PAGE_SIZE = 1000   # API max
 CF_PAGE_SIZE = 100
 SLEEP_BETWEEN_PATCHES = 0.2
@@ -97,8 +104,9 @@ def cfg(key, default=None):
 
 def api_base():
     explicit = (os.getenv("FLEXERA_API_BASE") or "").strip().rstrip("/")
-    if explicit:
-        return explicit
+    if explicit and "<" not in explicit:
+        u = urlparse(explicit)
+        return f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else explicit
     u = urlparse(cfg("FLEXERA_UPLOAD_URL"))
     if not u.scheme or not u.netloc:
         sys.exit("[config] Could not read a host from FLEXERA_UPLOAD_URL; set FLEXERA_API_BASE in .env")
@@ -148,7 +156,8 @@ def explain(resp, step):
         hint = ("\n          -> 403: this app registration lacks SaaS consolidation permission "
                 "(saas.consolidation.view.crud). Add it in Application registrations.")
     elif resp.status_code == 404:
-        hint = "\n          -> 404: endpoint not found on this host. Check FLEXERA_API_BASE."
+        hint = ("\n          -> 404: this route is not on this host. Run flexera_route_probe.py and set "
+                "CF_FIELDS_PATH / CF_USERS_PATH in .env to the routes that return 200.")
     sys.exit(f"[flexera] {step} failed: HTTP {resp.status_code} {resp.text[:500]}{hint}")
 
 
@@ -171,9 +180,14 @@ def paged_get(session, url, page_size, label):
 
 def find_field(session, base):
     fields = paged_get(session, base + CUSTOM_FIELDS_PATH, CF_PAGE_SIZE, "custom fields")
-    print(f"[flexera] {len(fields)} custom field(s) visible:")
+    cats = {}
     for f in fields:
-        print(f"          - {f.get('fieldName')} | category={f.get('saasCategory')} | type={f.get('dataType')}")
+        c = str(f.get("saasCategory"))
+        cats[c] = cats.get(c, 0) + 1
+    print(f"[flexera] {len(fields):,} custom field(s) visible, by category: {cats}")
+    for f in fields:
+        if FIELD_NAME.lower() in (f.get("fieldName") or "").lower():
+            print(f"          - {f.get('fieldName')} | category={f.get('saasCategory')} | type={f.get('dataType')}")
     match = [f for f in fields
              if (f.get("fieldName") or "").strip().lower() == FIELD_NAME.lower()
              and "user" in str(f.get("saasCategory") or "").lower()]
@@ -224,6 +238,7 @@ def set_value(session, base, user_id, field_name):
 def main():
     base = api_base()
     print(f"[config] API host: {base}")
+    print(f"[config] Routes: fields={CUSTOM_FIELDS_PATH} | values={CF_VALUES_PATH} | users={USERS_PATH}")
     print(f"[config] Field '{FIELD_NAME}' = '{FIELD_VALUE}' | "
           f"{'DRY RUN (nothing written)' if DRY_RUN else 'LIVE - values will be written'}")
 
