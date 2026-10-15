@@ -210,6 +210,9 @@ def find_field(session, base):
     return name
 
 
+_existing_cache = {}   # user ID -> list of current custom fields (when the users list includes them)
+
+
 def email_map(session, base):
     users = paged_get(session, base + USERS_PATH, USERS_PAGE_SIZE, "SaaS users")
     m = {}
@@ -217,8 +220,48 @@ def email_map(session, base):
         e = (u.get("email") or "").strip().lower()
         if e and u.get("id"):
             m.setdefault(e, []).append(u["id"])
+            if isinstance(u.get("customFields"), list):
+                _existing_cache[u["id"]] = u["customFields"]
     print(f"[flexera] {len(users):,} SaaS users, {len(m):,} distinct emails")
     return m
+
+
+def read_existing(session, base, user_id):
+    """Current custom fields for one user, as the UI reads them: GET .../users/{id} -> customFields.
+    Returns a list (possibly empty), or None if they could not be read (then we must NOT write)."""
+    if user_id in _existing_cache:
+        return _existing_cache[user_id]
+    resp = call(session, "GET", f"{base}{USERS_PATH.rstrip('/')}/{user_id}")
+    if not resp.ok:
+        print(f"          read failed for {user_id}: HTTP {resp.status_code} {resp.text[:150]}")
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    cf = body.get("customFields")
+    if cf is None:
+        # Some responses omit the key when a user has no values; treat explicit null/absent as unknown
+        print(f"          no 'customFields' key in user response for {user_id}; keys: {', '.join(list(body)[:12])}")
+        return None
+    return cf if isinstance(cf, list) else None
+
+
+def merge_fields(existing, field_name, value):
+    """Keep every existing field as it is; set/replace field_name. Same shape the UI sends."""
+    merged, replaced = [], False
+    for f in existing:
+        name = f.get("name") if isinstance(f, dict) else None
+        if not name:
+            continue
+        if name.strip().lower() == field_name.lower():
+            merged.append({"name": field_name, "value": value})
+            replaced = True
+        else:
+            merged.append({"name": name, "value": f.get("value")})
+    if not replaced:
+        merged.append({"name": field_name, "value": value})
+    return merged
 
 
 def read_emails():
@@ -241,11 +284,11 @@ def read_emails():
 _working_ct = None   # remembered once a content type is accepted
 
 
-def set_value(session, base, user_id, field_name):
-    """Same body shape the Flexera UI sends: {customFields:[{name,value}], id, saasCategory}."""
+def set_value(session, base, user_id, custom_fields):
+    """Same body shape the Flexera UI sends: {customFields:[ALL fields], id, saasCategory}.
+    The endpoint REPLACES the user's whole list, so custom_fields must include the existing ones."""
     global _working_ct
-    payload = {"customFields": [{"name": field_name, "value": FIELD_VALUE}],
-               "id": user_id, "saasCategory": "User"}
+    payload = {"customFields": custom_fields, "id": user_id, "saasCategory": "User"}
     body = json.dumps(payload).encode("utf-8")
     resp = None
     for ct in ([_working_ct] if _working_ct else CONTENT_TYPES):
@@ -290,12 +333,28 @@ def main():
             results.append([email, "", "SKIPPED", "email not found in SaaS users"])
             continue
         for uid in ids:   # one email can map to more than one SaaS user record
-            if DRY_RUN:
-                results.append([email, uid, "DRY_RUN", f"would set {field_name}={FIELD_VALUE}"])
+            existing = read_existing(session, base, uid)
+            if existing is None:
+                results.append([email, uid, "SKIPPED",
+                                "could not read existing custom fields - not written (protects other values)"])
                 continue
-            resp, sent = set_value(session, base, uid, field_name)
+            current = next((f.get("value") for f in existing if isinstance(f, dict)
+                            and (f.get("name") or "").strip().lower() == field_name.lower()), None)
+            others = [f.get("name") for f in existing if isinstance(f, dict)
+                      and (f.get("name") or "").strip().lower() != field_name.lower()]
+            keep_note = f"keeps {len(others)} other field(s): {', '.join(others) or '-'}"
+            if current is not None and str(current) == FIELD_VALUE:
+                results.append([email, uid, "UNCHANGED", f"{field_name} already '{FIELD_VALUE}'"])
+                continue
+            merged = merge_fields(existing, field_name, FIELD_VALUE)
+            if DRY_RUN:
+                results.append([email, uid, "DRY_RUN",
+                                f"would set {field_name}={FIELD_VALUE} (was {current!r}); {keep_note}"])
+                print(f"          {email}: would send {json.dumps(merged)}")
+                continue
+            resp, sent = set_value(session, base, uid, merged)
             if resp.ok:
-                results.append([email, uid, "OK", resp.text[:200]])
+                results.append([email, uid, "OK", f"{field_name}={FIELD_VALUE} (was {current!r}); {keep_note}"])
             else:
                 results.append([email, uid, f"FAILED {resp.status_code}", resp.text[:300]])
                 if not first_error_shown:
