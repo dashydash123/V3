@@ -4,6 +4,7 @@ sfdc_to_flexera.py  -  Salesforce users -> CSV -> Flexera SaaS user custom field
   1. EXTRACT  Salesforce OAuth (refresh token) -> SOQL on User (all pages) -> CSV in the output folder
               Columns: Id, Name, Username, LastLoginDate, ProfileName, UserLicenseName, Email,
                        IsActive, UserPermissionsSupportUser
+              LastLoginDate is written as ISO 8601 UTC with Z: 2025-01-08T16:30:43Z (blank = never logged in)
   2. UPDATE   For each user, set Flexera SaaS custom fields SFDC_<column>:
                   IsActive                    -> SFDC_IsActive
                   UserPermissionsSupportUser  -> SFDC_UserPermissionsSupportUser
@@ -63,7 +64,7 @@ import shutil
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -225,6 +226,36 @@ def norm_value(v):
     return s
 
 
+ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"          # 2026-09-29T10:22:33Z (same as the ADO script)
+DATE_COLUMNS = {"LastLoginDate"}
+
+
+def to_iso_z(v):
+    """Salesforce '2025-01-08T16:30:43.000+0000' -> '2025-01-08T16:30:43Z' (UTC). Blank stays blank."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    if isinstance(v, datetime):
+        dt = v
+    else:
+        s = str(v).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+0000"
+        dt = None
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s.replace("+00:00", "+0000"), fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            print(f"[sfdc] Unrecognised date '{v}' - kept as it is")
+            return s
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime(ISO_FMT)
+
+
 def unique_path(path):
     n, p = 2, path
     while p.exists():
@@ -315,7 +346,13 @@ def extract_salesforce():
         row = {}
         for f in SOQL_FIELDS:
             v = r.get(f)
-            row[CSV_COLUMNS[f]] = ("TRUE" if v else "FALSE") if isinstance(v, bool) else ("" if v is None else v)
+            col = CSV_COLUMNS[f]
+            if col in DATE_COLUMNS:
+                row[col] = to_iso_z(v)
+            elif isinstance(v, bool):
+                row[col] = "TRUE" if v else "FALSE"
+            else:
+                row[col] = "" if v is None else v
         rows.append(row)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
