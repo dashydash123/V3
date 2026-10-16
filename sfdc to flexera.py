@@ -51,8 +51,7 @@ Before the first update: create in Flexera  SaaS settings > Custom fields > Add 
   SFDC_IsActive   and   SFDC_UserPermissionsSupportUser
 
 Output files (in OUTPUT_DIR)
-  salesforce_users_<timestamp>.csv          full Salesforce extract of this run
-  salesforce_users_latest.csv               copy of the newest extract
+  salesforce_users_latest.csv               full Salesforce extract (overwritten every run)
   sfdc_custom_fields_results_<timestamp>.csv one row per user: status, values, other fields kept
 
 Requires:  python -m pip install requests python-dotenv     (+ openpyxl only to read an .xlsx input)
@@ -60,7 +59,6 @@ Requires:  python -m pip install requests python-dotenv     (+ openpyxl only to 
 import csv
 import json
 import os
-import shutil
 import sys
 import time
 import traceback
@@ -356,16 +354,17 @@ def extract_salesforce():
         rows.append(row)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = unique_path(OUTPUT_DIR / f"salesforce_users_{STAMP}.csv")
-    with open(out, "w", newline="", encoding="utf-8-sig") as f:
+    out = OUTPUT_DIR / "salesforce_users_latest.csv"
+    tmp = out.with_suffix(".csv.tmp")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=list(CSV_COLUMNS.values()))
         w.writeheader()
         w.writerows(rows)
-    latest = OUTPUT_DIR / "salesforce_users_latest.csv"
     try:
-        shutil.copyfile(out, latest)
+        os.replace(tmp, out)             # only replaced once the new file is complete
     except PermissionError:
-        print(f"[sfdc] Could not refresh {latest.name} (open in Excel?) - the timestamped file is complete")
+        sys.exit(f"[sfdc] {out.name} is open (probably in Excel). Close it and re-run.\n"
+                 f"       This run's extract is kept in {tmp}")
     active = sum(1 for r in rows if r.get("IsActive") == "TRUE")
     print(f"[sfdc] {len(rows):,} users ({active:,} active) -> {out}")
     return rows
