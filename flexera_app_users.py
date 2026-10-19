@@ -10,7 +10,9 @@ Output: <APP_NAME>_users.xlsx next to this script (overwritten each run)
   - Sheet "Application" : the application record (field / value).
 
 Settings come from a .env file next to this script:
-    BASE_URL, CLIENT_ID, CLIENT_SECRET, APP_NAME, PAGE_SIZE
+    BASE_URL, CLIENT_ID, CLIENT_SECRET, APP_NAME, PAGE_SIZE, PAGE_DELAY (optional)
+
+If Flexera returns 429 (rate limit), the script waits and retries automatically.
 
 Standard library only (no pip installs needed).
 """
@@ -19,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,17 +53,45 @@ CLIENT_ID = os.environ.get("CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
 APP_NAME = os.environ.get("APP_NAME", "")
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100") or 100)
+PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "2") or 2)  # seconds between page calls
 
 
 # ---------- HTTP helpers ----------
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_RETRIES = 8
+
+
+def _wait_seconds(e, attempt):
+    """Use the server's Retry-After / reset header if present, else back off 5,10,20,40,60,60..."""
+    for h in ("Retry-After", "X-RateLimit-Reset", "RateLimit-Reset"):
+        v = e.headers.get(h) if e.headers else None
+        if v:
+            try:
+                secs = float(v)
+                if secs > 1e9:  # epoch timestamp, not seconds
+                    secs = secs - time.time()
+                if 0 < secs <= 300:
+                    return secs + 1
+            except ValueError:
+                pass
+    return min(5 * (2 ** attempt), 60)
+
+
 def http_request(url, method="GET", headers=None, data=None):
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} on {method} {url}\n{body[:1000]}") from e
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code in RETRY_STATUSES and attempt < MAX_RETRIES:
+                wait = _wait_seconds(e, attempt)
+                print(f"    HTTP {e.code} (rate limit / server busy) - waiting {wait:.0f}s, "
+                      f"retry {attempt + 1}/{MAX_RETRIES} ...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"HTTP {e.code} on {method} {url}\n{body[:1000]}") from e
 
 
 def get_token():
@@ -288,6 +319,7 @@ def main():
         if len(items) < PAGE_SIZE:
             break
         page += 1
+        time.sleep(PAGE_DELAY)  # stay under the tenant rate limit
 
     # Every field returned by the API becomes a column (order of first appearance)
     columns = []
